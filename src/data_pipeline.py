@@ -24,11 +24,21 @@ def fetch_ohlcv(symbol: str, period: str = None, force_refresh: bool = False) ->
     path = _cache_path(symbol)
 
     if os.path.exists(path) and not force_refresh:
-        df = pd.read_parquet(path)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        df.index = df.index.normalize()
-        return df
+        try:
+            df = pd.read_parquet(path)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            df.index = df.index.normalize()
+            return df
+        except Exception as e:
+            # Cache file exists but is corrupted/truncated (e.g. left over
+            # from a previously interrupted run). Treat as a cache miss
+            # rather than crashing the whole pipeline.
+            print(f"[data_pipeline] Cache for {symbol} unreadable ({e}); refetching.")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period)

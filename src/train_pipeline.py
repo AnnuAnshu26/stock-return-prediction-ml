@@ -15,9 +15,11 @@ This script:
   7. Saves everything to experiments/results/ for the paper
 """
 import argparse
+import gc
 import os
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 
 from . import config
@@ -37,7 +39,7 @@ def structure_sequences(feature_arr, target_arr, time_steps):
     return np.array(X), np.array(y)
 
 
-def run_fold(processed_df: pd.DataFrame, fold, epochs_scale: float = 1.0):
+def run_fold(processed_df: pd.DataFrame, fold, symbol: str, epochs_scale: float = 1.0):
     """
     Fits every model on one walk-forward fold and returns per-model metrics
     plus raw predictions (needed later for DM tests and backtesting).
@@ -146,11 +148,38 @@ def run_fold(processed_df: pd.DataFrame, fold, epochs_scale: float = 1.0):
         m['Fold'] = fold.fold_id
         fold_metrics.append(m)
 
-    return {
+    result = {
         'metrics': fold_metrics,
         'predictions': predictions,
         'y_test': y_test_seq,
     }
+
+    # Persist raw predictions + actuals for this fold. The aggregated
+    # metrics above are enough for the Results tables, but the trading
+    # backtest (backtest.py) and any later DM significance re-analysis
+    # need the actual day-by-day predicted vs. realized returns, not
+    # just summary statistics — those can't be reconstructed from MAE/R2
+    # after the fact.
+    os.makedirs(os.path.join(config.RESULTS_DIR, 'predictions'), exist_ok=True)
+    pred_df = pd.DataFrame({name: pred for name, pred in predictions.items()})
+    pred_df['y_true'] = y_test_seq
+    pred_df.to_csv(
+        os.path.join(config.RESULTS_DIR, 'predictions', f'{symbol}_fold{fold.fold_id}.csv'),
+        index=False
+    )
+
+    # Release the LSTM/GRU/Transformer models explicitly and clear Keras's
+    # backend graph state. Without this, building a fresh Sequential/Model
+    # every fold (up to ~380 times across a full 20-stock x 19-fold run)
+    # steadily accumulates TensorFlow graph state until the process runs
+    # out of memory — which is what caused the XGBoost bad_malloc errors
+    # partway through a full run (XGBoost just happened to be the model
+    # that hit the wall first, the leak itself was upstream).
+    del lstm, gru, transformer
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    return result
 
 
 def run_stock(symbol: str, market_context, epochs_scale: float = 1.0):
@@ -167,7 +196,16 @@ def run_stock(symbol: str, market_context, epochs_scale: float = 1.0):
 
     all_rows = []
     for fold in folds:
-        result = run_fold(processed, fold, epochs_scale=epochs_scale)
+        try:
+            result = run_fold(processed, fold, symbol, epochs_scale=epochs_scale)
+        except Exception as e:
+            # A single fold failing (e.g. transient OOM) should not discard
+            # every fold already completed for this stock. Log and move on.
+            print(f"  Fold {fold.fold_id}: FAILED ({e}) — skipping this fold")
+            tf.keras.backend.clear_session()
+            gc.collect()
+            continue
+
         if result is None:
             continue
         for row in result['metrics']:
@@ -188,27 +226,58 @@ def run_stock(symbol: str, market_context, epochs_scale: float = 1.0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="Smoke test: 2 stocks, fewer epochs")
+    parser.add_argument("--fresh", action="store_true", help="Ignore existing results and start over")
+    parser.add_argument("--stock", type=str, default=None,
+                         help="Process only this one stock symbol, then exit. "
+                              "Used by run_all_stocks.ps1 to isolate each stock in its own "
+                              "OS process so Windows fully reclaims memory between stocks, "
+                              "instead of one long-lived process accumulating memory over "
+                              "~15+ stocks until XGBoost/TensorFlow hit a bad_alloc.")
     args = parser.parse_args()
 
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    out_path = os.path.join(config.RESULTS_DIR, "walk_forward_results.csv")
 
-    stocks = config.STOCKS[:2] if args.quick else config.STOCKS
+    if args.stock:
+        stocks = [args.stock]
+    elif args.quick:
+        stocks = config.STOCKS[:2]
+    else:
+        stocks = config.STOCKS
     epochs_scale = 0.2 if args.quick else 1.0
+
+    # --- Resume support: skip stocks already fully recorded from a prior
+    # (possibly crashed) run, so a failure late in a 20-stock run doesn't
+    # force you to redo everything from scratch. ---
+    existing_df = None
+    completed_stocks = set()
+    if os.path.exists(out_path) and not args.fresh:
+        existing_df = pd.read_csv(out_path)
+        completed_stocks = set(existing_df["Stock"].unique())
+        if completed_stocks:
+            print(f"Resuming: found {len(completed_stocks)} already-completed stocks in {out_path}")
+            print(f"  ({sorted(completed_stocks)})")
 
     print("Fetching market context (S&P 500, VIX)...")
     market_context = fetch_market_context()
 
-    all_results = []
+    all_results = [] if existing_df is None else existing_df.to_dict("records")
+
     for symbol in stocks:
+        if symbol in completed_stocks:
+            print(f"=== Skipping {symbol} (already completed, use --fresh to redo) ===")
+            continue
         try:
             rows = run_stock(symbol, market_context, epochs_scale=epochs_scale)
             all_results.extend(rows)
         except Exception as e:
             print(f"[ERROR] {symbol} failed: {e}")
 
+        # Save after every stock, not just at the end — so a crash on
+        # stock N doesn't cost you the results from stocks 1..N-1.
+        pd.DataFrame(all_results).to_csv(out_path, index=False)
+
     results_df = pd.DataFrame(all_results)
-    out_path = os.path.join(config.RESULTS_DIR, "walk_forward_results.csv")
-    results_df.to_csv(out_path, index=False)
     print(f"\nSaved {len(results_df)} rows to {out_path}")
 
     if not results_df.empty:

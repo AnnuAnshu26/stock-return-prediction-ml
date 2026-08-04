@@ -61,18 +61,26 @@ def fit_linear_regression(X_train_2d, y_train):
 
 
 def fit_random_forest(X_train_2d, y_train):
+    # n_jobs capped at 4 rather than -1 (all cores): each parallel worker
+    # needs its own scratch buffers, and n_jobs=-1 on a machine with many
+    # logical cores multiplies peak memory usage substantially. This showed
+    # up as a hard process crash (not a catchable Python exception) on IBM
+    # after ~17 stocks of a long session, most likely from cumulative
+    # system-wide memory pressure combined with this per-fold thread fan-out.
     model = RandomForestRegressor(
-        n_estimators=200, max_depth=10, random_state=config.RANDOM_SEED, n_jobs=-1
+        n_estimators=200, max_depth=10, random_state=config.RANDOM_SEED, n_jobs=4
     )
     model.fit(X_train_2d, y_train)
     return model
 
 
 def fit_xgboost(X_train_2d, y_train):
+    # Same reasoning as fit_random_forest above: capped n_jobs to reduce
+    # peak memory from parallel histogram-building buffers.
     model = XGBRegressor(
         n_estimators=300, learning_rate=0.03, max_depth=5,
         subsample=0.8, colsample_bytree=0.8,
-        random_state=config.RANDOM_SEED, n_jobs=-1
+        random_state=config.RANDOM_SEED, n_jobs=4
     )
     model.fit(X_train_2d, y_train)
     return model
